@@ -80,3 +80,7 @@ If something fails only on XPU, check the shim first.
 ## Credits
 
 All the actual training code is [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit). This repo only packages it for Intel Arc.
+
+## License
+
+MIT, see [LICENSE](LICENSE). ai-toolkit itself is MIT-licensed by ostris.
