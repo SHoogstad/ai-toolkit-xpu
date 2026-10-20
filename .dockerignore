@@ -2,3 +2,4 @@
 !xpu_shim.py
 !nvidia-smi
 !start.sh
+!patches/

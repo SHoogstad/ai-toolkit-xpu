@@ -229,9 +229,12 @@ def _install():
     # 4 GB on a busy host). Past that, every H2D copy from a pinned buffer
     # remaps it: layer offloading drops from 14 GB/s to ~0.6 GB/s, and the remap
     # VM jobs can trip the driver's job timeout (DEVICE_LOST). Pageable copies go
-    # through driver staging at ~8 GB/s at any size, so pin only a small budget
-    # and leave the rest pageable.
-    budget = int(float(os.environ.get("AITK_XPU_PIN_BUDGET_GB", "2")) * 1024 ** 3)
+    # through driver staging at ~4-8 GB/s at any size. Mixing the two is worst of
+    # all: pinned buffers plus the driver's own staging buffers overflow the
+    # mapping, and Krea 2's real offloaded weights (2 GB pinned + 7.5 GB
+    # pageable) copied at 0.4 GB/s vs 4.5 GB/s all-pageable. So don't pin by
+    # default; AITK_XPU_PIN_BUDGET_GB allows a budget for experiments.
+    budget = int(float(os.environ.get("AITK_XPU_PIN_BUDGET_GB", "0")) * 1024 ** 3)
     pinned = {"bytes": 0}
     _pin_memory = torch.Tensor.pin_memory
 
