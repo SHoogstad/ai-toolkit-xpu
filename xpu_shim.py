@@ -8,6 +8,7 @@ Intel Arc GPU without editing every call site.
 import functools
 import os
 import sys
+import weakref
 
 
 def _install():
@@ -222,6 +223,43 @@ def _install():
     cuda_amp.autocast = cuda_autocast
     cuda.amp.autocast = cuda_autocast
 
+    # ---- pinned host memory budget --------------------------------------
+    # The xe/Level Zero stack keeps only part of pinned host memory mapped for
+    # the GPU, and how much varies with system state (~8 GB when idle, under
+    # 4 GB on a busy host). Past that, every H2D copy from a pinned buffer
+    # remaps it: layer offloading drops from 14 GB/s to ~0.6 GB/s, and the remap
+    # VM jobs can trip the driver's job timeout (DEVICE_LOST). Pageable copies go
+    # through driver staging at ~8 GB/s at any size, so pin only a small budget
+    # and leave the rest pageable.
+    budget = int(float(os.environ.get("AITK_XPU_PIN_BUDGET_GB", "2")) * 1024 ** 3)
+    pinned = {"bytes": 0}
+    _pin_memory = torch.Tensor.pin_memory
+
+    def _unpinned(nbytes):
+        pinned["bytes"] -= nbytes
+
+    def pin_memory(self, *args, **kwargs):
+        nbytes = self.untyped_storage().nbytes()
+        if pinned["bytes"] + nbytes > budget:
+            return self
+        out = _pin_memory(self, *args, **kwargs)
+        pinned["bytes"] += nbytes
+        weakref.finalize(out, _unpinned, nbytes)
+        return out
+
+    torch.Tensor.pin_memory = pin_memory
+
+    # ---- VRAM cap -------------------------------------------------------
+    # The xe driver never refuses a device allocation: past physical VRAM it
+    # silently evicts to system memory (~20x slower), so torch's caching
+    # allocator keeps growing instead of reusing its cache. Capping it below
+    # physical VRAM makes it free cached blocks first and raise a real OOM
+    # when the model doesn't fit. Leave ~10% for Level Zero / kernels.
+    # AITK_XPU_MEM_FRACTION=1 restores the old (overcommitting) behaviour.
+    frac = float(os.environ.get("AITK_XPU_MEM_FRACTION", "0.9"))
+    if 0 < frac < 1:
+        xpu.set_per_process_memory_fraction(frac)
+
     # ---- safetensors ----------------------------------------------------
     try:
         import safetensors.torch as st
@@ -239,7 +277,8 @@ def _install():
     except Exception as e:  # pragma: no cover
         print(f"[xpu_shim] safetensors patch skipped: {e}", file=sys.stderr)
 
-    print(f"[xpu_shim] cuda -> xpu ({xpu.get_device_name(0)})", file=sys.stderr)
+    print(f"[xpu_shim] cuda -> xpu ({xpu.get_device_name(0)}), vram cap {frac:g}, "
+          f"pin budget {budget / 1024 ** 3:g} GB", file=sys.stderr)
 
 
 if os.environ.get("AITK_XPU") == "1":
