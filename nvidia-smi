@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Minimal nvidia-smi stand-in for an Intel Arc (xe driver) so the ai-toolkit
+UI can list the GPU and show stats. Supports `-L` and
+`--query-gpu=... --format=csv,noheader,nounits [-lms N]`.
+
+VRAM use and load come from DRM fdinfo of processes in this container;
+temperature, fan, power and clocks from the xe hwmon / sysfs.
+"""
+import glob
+import os
+import sys
+import time
+
+NAME = os.environ.get("XPU_GPU_NAME", "Intel Arc B580")
+TOTAL_MB = int(os.environ.get("XPU_VRAM_MB", "12216"))
+
+
+def card_dir():
+    for c in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+        if os.path.basename(os.path.realpath(c + "/device/driver")) in ("xe", "i915"):
+            return c + "/device"
+    return None
+
+
+DEV = card_dir()
+HWMON = (glob.glob(DEV + "/hwmon/hwmon*") or [None])[0] if DEV else None
+
+
+def rd(path, default=0):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except Exception:
+        return default
+
+
+def fdinfo():
+    vram_kib, cycles, total = 0, 0, 0
+    seen = set()
+    for p in glob.glob("/proc/[0-9]*/fdinfo/*"):
+        try:
+            with open(p) as f:
+                d = dict(l.split(":", 1) for l in f if ":" in l)
+        except Exception:
+            continue
+        cid = d.get("drm-client-id", "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        for k, v in d.items():
+            v = v.strip()
+            if k.startswith("drm-resident-vram"):
+                n, *u = v.split()
+                unit = u[0] if u else "B"
+                vram_kib += int(n) * {"B": 1 / 1024, "KiB": 1, "MiB": 1024, "GiB": 1048576}.get(unit, 1)
+            elif k.startswith("drm-cycles-"):
+                cycles += int(v.split()[0])
+            elif k.startswith("drm-total-cycles-"):
+                total = max(total, int(v.split()[0]))
+    return int(vram_kib) // 1024, cycles, total
+
+
+_prev = {}
+
+
+def sample():
+    used, cycles, total = fdinfo()
+    util = 0
+    energy = rd(HWMON + "/energy1_input") if HWMON else 0  # microjoules
+    now = time.time()
+    power = 0.0
+    if _prev:
+        dc, dt = cycles - _prev["c"], total - _prev["t"]
+        if dt > 0:
+            util = max(0, min(100, round(100 * dc / dt)))
+        if now > _prev["now"]:
+            power = max(0.0, (energy - _prev["e"]) / 1e6 / (now - _prev["now"]))
+    _prev.update(c=cycles, t=total, e=energy, now=now)
+    temp = rd(HWMON + "/temp2_input") // 1000 if HWMON else 0
+    fan = rd(HWMON + "/fan1_input") if HWMON else 0
+    plimit = rd(HWMON + "/power1_cap") / 1e6 if HWMON else 0
+    clk = rd(DEV + "/tile0/gt0/freq0/act_freq") if DEV else 0
+    vals = {
+        "index": "0", "name": NAME, "driver_version": "xe",
+        "temperature.gpu": temp, "utilization.gpu": util,
+        "utilization.memory": round(100 * used / TOTAL_MB),
+        "memory.total": TOTAL_MB, "memory.free": TOTAL_MB - used, "memory.used": used,
+        "power.draw": f"{power:.2f}", "power.limit": f"{plimit:.2f}",
+        "clocks.current.graphics": clk, "clocks.current.memory": 0,
+        "fan.speed": min(100, round(fan / 30)) if fan else 0,
+    }
+    return vals
+
+
+def main(argv):
+    if "-L" in argv:
+        print(f"GPU 0: {NAME} (UUID: GPU-xpu-0)")
+        return
+    q = next((a.split("=", 1)[1] for a in argv if a.startswith("--query-gpu=")), None)
+    if q is None:
+        print(f"nvidia-smi shim for {NAME}")
+        return
+    fields = q.split(",")
+    loop_ms = None
+    if "-lms" in argv:
+        loop_ms = int(argv[argv.index("-lms") + 1])
+    sample()  # prime deltas
+    time.sleep(0.2 if loop_ms is None else loop_ms / 1000)
+    while True:
+        v = sample()
+        print(", ".join(str(v.get(f, "[N/A]")) for f in fields), flush=True)
+        if loop_ms is None:
+            return
+        time.sleep(loop_ms / 1000)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
