@@ -13,7 +13,19 @@ Upstream ai-toolkit only supports CUDA. Rather than patching every call site, th
 | `nvidia-smi` | A stand-in so the UI can list the GPU and show VRAM, load, temperature and power (from DRM fdinfo and xe hwmon) |
 | `start.sh` | Creates or upgrades the SQLite schema, then starts the UI |
 
+## Get the image
+
+A prebuilt image is on Docker Hub as [`hoogstaddie/ai-toolkit-xpu`](https://hub.docker.com/r/hoogstaddie/ai-toolkit-xpu):
+
+```bash
+docker pull hoogstaddie/ai-toolkit-xpu:latest
+```
+
+Each tag besides `latest` is the short upstream ai-toolkit commit the image was built from (e.g. `0473387`). It's about 12 GB.
+
 ## Build
+
+To build it yourself instead:
 
 ```bash
 docker build --build-arg CACHEBUST=$(date +%s) -t ai-toolkit:xpu .
@@ -35,8 +47,10 @@ docker run -d --name ai-toolkit-xpu \
   -v /path/to/config:/app/ai-toolkit/config \
   -v /path/to/datasets:/app/ai-toolkit/datasets \
   -v /path/to/output:/app/ai-toolkit/output \
-  ai-toolkit:xpu
+  hoogstaddie/ai-toolkit-xpu:latest
 ```
+
+(Use `ai-toolkit:xpu` instead if you built it locally.)
 
 Then open `http://<host>:8675`. Jobs can keep `device: cuda`, because the shim maps it to the Arc GPU.
 
