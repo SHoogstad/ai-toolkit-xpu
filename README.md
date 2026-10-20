@@ -2,7 +2,7 @@
 
 A Docker image that runs [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit) (UI and trainer) on an Intel Arc GPU. It was built and tested on an **Arc B580 (12 GB)**.
 
-Upstream ai-toolkit only supports CUDA. Rather than patching every call site, this image keeps upstream unmodified (apart from two `sed` tweaks) and loads a small **cuda → xpu shim** when Python starts. The shim redirects `"cuda"` devices, `torch.cuda.*` and autocast to `torch.xpu`.
+Upstream ai-toolkit only supports CUDA. Rather than patching every call site, this image keeps upstream nearly unmodified (two `sed` tweaks and one Krea 2 attention patch) and loads a small **cuda → xpu shim** when Python starts. The shim redirects `"cuda"` devices, `torch.cuda.*` and autocast to `torch.xpu`, and works around Intel driver memory behaviour (see [Memory on XPU](#memory-on-xpu)).
 
 ## What's in here
 
@@ -12,6 +12,7 @@ Upstream ai-toolkit only supports CUDA. Rather than patching every call site, th
 | `xpu_shim.py` | The cuda → xpu remapping, loaded through a `.pth` file when `AITK_XPU=1` |
 | `nvidia-smi` | A stand-in so the UI can list the GPU and show VRAM, load, temperature and power (from DRM fdinfo and xe hwmon) |
 | `start.sh` | Creates or upgrades the SQLite schema, then starts the UI |
+| `patches/krea2_xpu_attention.py` | Applied at build time: lets Krea 2 use the fused attention kernel on XPU |
 
 ## Get the image
 
@@ -21,7 +22,7 @@ A prebuilt image is on Docker Hub as [`hoogstaddie/ai-toolkit-xpu`](https://hub.
 docker pull hoogstaddie/ai-toolkit-xpu:latest
 ```
 
-Each tag besides `latest` is the short upstream ai-toolkit commit the image was built from (e.g. `0473387`). It's about 12 GB.
+Tags: `latest`, release tags such as `v1.1.0` (matching the [GitHub releases](https://github.com/SHoogstad/ai-toolkit-xpu/releases)), and `0473387` for v1.0.0. It's about 12 GB on disk (4.1 GB download).
 
 ## Build
 
@@ -41,6 +42,7 @@ touch /path/to/aitk_db.db
 docker run -d --name ai-toolkit-xpu \
   --device /dev/dri/card0 --device /dev/dri/renderD128 \
   -p 8675:8675 \
+  --shm-size=16g --memory=28g \
   -e TZ=Europe/Amsterdam \
   -v /path/to/hf-cache:/root/.cache/huggingface/hub \
   -v /path/to/aitk_db.db:/app/ai-toolkit/aitk_db.db \
@@ -56,6 +58,10 @@ Then open `http://<host>:8675`. Jobs can keep `device: cuda`, because the shim m
 
 > **Keep `AI_TOOLKIT_DB_JOURNAL_MODE=DELETE`** (the image sets it). The UI's default WAL mode keeps recent writes in an `aitk_db.db-wal` side file. When only the `.db` file is bind-mounted, that side file lives inside the container, and recreating the container loses recent jobs.
 
+- **`--shm-size=16g`**: Docker's default 64 MB of shared memory is too small for the data-loader workers on large models. Krea 2 crashes with "unable to allocate shared memory". Only memory actually in use is consumed.
+- **`--memory=…`** (adjust to your RAM): big models load their full checkpoint into RAM (Krea 2 peaks at about 26 GB). With a limit, a runaway job gets killed instead of pushing the host into swap until it stops responding.
+- **Unraid:** mount the `.db` file from its disk path (`/mnt/diskN/…` or `/mnt/cache/…`), not `/mnt/user/…`. SQLite through the FUSE layer can fail mid-run with "attempt to write a readonly database" (error 1032). Job status then freezes, and Stop stops working.
+
 ## Benchmarks: Arc B580 vs RTX 3060 12 GB
 
 SDXL LoRA (rank 16, 1024 px, gradient checkpointing on, bf16). Seconds per image, lower is better:
@@ -69,13 +75,34 @@ SDXL LoRA (rank 16, 1024 px, gradient checkpointing on, bf16). Seconds per image
 Raw bf16 matmul throughput: 27 TFLOPS on the 3060, 104 TFLOPS on the B580.
 
 - **Use plain `adamw` on XPU.** bitsandbytes' 8-bit AdamW is slow there. The image makes `adamw` the UI default for new jobs.
-- Keep **gradient checkpointing on**. Without it, the B580 silently spills into system RAM (about 30 s/it).
+- Keep **gradient checkpointing on**. Without it, SDXL at 1024 px doesn't fit in 12 GB: it runs out of VRAM (before v1.1.0 it silently spilled into system RAM at about 30 s/it).
 - `torch.compile` does not work: inductor's `get_gpu_type` asserts when both `cuda` and `xpu` appear available.
 
 ## Verified models
 
 - **SDXL**: LoRA training and sampling work.
 - **Anima** (`circlestone-labs/Anima-Base-v1.0-Diffusers`): LoRA training and sampling work in bf16 and qfloat8. A 60-image character LoRA at batch 2 ran at about 2.4 s/img.
+- **Krea 2** (`krea/Krea-2-Raw`, about 12B): LoRA training works on the 12 GB B580 with `convrot8` quantization, layer offloading and 512/768 px. Seconds per step (batch 1 × gradient accumulation 2):
+
+  | Transformer offload | Step time | |
+  |---|---|---|
+  | 80% | about 29 s | stable |
+  | **60%** | **about 11 s** | **stable, recommended** |
+  | 50% | about 11.5 s | occasional OOM-skipped batch |
+  | 40% | n/a | aborts: out of VRAM |
+
+  Leave 1024 px out of the training resolutions: its activations don't fit next to the weights.
+
+## Memory on XPU
+
+Intel's xe driver behaves differently from CUDA in two ways that matter for big models, and the shim compensates for both:
+
+- **Pinned host memory doesn't scale.** The driver keeps only part of pinned RAM mapped for the GPU, and how much varies with system load: about 8 GB on an idle host, under 4 GB on a busy one. Past that, every host→GPU copy from pinned memory remaps it. Copies drop from 14 GB/s to about 0.5 GB/s, and the remap jobs can exceed the driver's job timeout, so the GPU resets with `UR_RESULT_ERROR_DEVICE_LOST`. Mixing pinned and pageable memory is worst of all. ai-toolkit's layer offloading pins everything, so **the shim makes `pin_memory()` a no-op by default** (`AITK_XPU_PIN_BUDGET_GB=0`). Pageable copies run at a steady 4–8 GB/s at any size.
+- **VRAM is overcommitted silently.** The driver never refuses a GPU allocation. Past physical VRAM it evicts to system RAM, about 20× slower, so PyTorch's caching allocator keeps growing instead of reusing memory. **The shim caps PyTorch at 90% of VRAM** (`AITK_XPU_MEM_FRACTION=0.9`). PyTorch then reuses its cache, and a job that really doesn't fit gets a clear OOM instead of crawling.
+
+Both can be overridden with `-e`. Set `AITK_XPU_MEM_FRACTION=1` for the old overcommitting behaviour.
+
+Krea 2 additionally always passed an attention mask, which forces XPU's slow MATH attention: 6× slower, with the full attention matrix in VRAM. `patches/krea2_xpu_attention.py` skips the mask when nothing is actually masked, which is numerically identical.
 
 ## Shim notes / gotchas
 
