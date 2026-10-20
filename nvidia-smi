@@ -1,10 +1,15 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -S
 """Minimal nvidia-smi stand-in for an Intel Arc (xe driver) so the ai-toolkit
 UI can list the GPU and show stats. Supports `-L` and
 `--query-gpu=... --format=csv,noheader,nounits [-lms N]`.
 
 VRAM use and load come from DRM fdinfo of processes in this container;
 temperature, fan, power and clocks from the xe hwmon / sysfs.
+
+Runs with -S (no site-packages) so the xpu shim's .pth hook doesn't import
+torch and open a GPU context on every call: the UI polls this every few
+seconds, and with the shim each call cost ~1 s of CPU and ~850 MB of RAM while
+competing with training for the GPU. Only the stdlib is needed.
 """
 import glob
 import os
