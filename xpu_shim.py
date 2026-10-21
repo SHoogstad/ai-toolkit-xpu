@@ -263,6 +263,82 @@ def _install():
     if 0 < frac < 1:
         xpu.set_per_process_memory_fraction(frac)
 
+    # ---- masked attention -------------------------------------------------
+    # On XPU any attn_mask sends SDPA to the MATH backend, which materializes
+    # the full fp32 score matrix (and its gradient): GBs per call at DiT
+    # sequence lengths (Krea 2: 1.1 GB per score tensor), which is what forces
+    # heavy layer offloading. Route masked calls whose score matrix exceeds
+    # AITK_XPU_ATTN_MB (default 512) through xpu_attention.exact_attention:
+    # chunked, recomputed in backward, MATH-level fp32 numerics (verified
+    # against float64 on Krea 2's extreme block-0 logits, where the fused
+    # kernel's gradients are off by 6x). Smaller masked calls stay on MATH,
+    # unmasked calls stay on the fused kernel. AITK_XPU_ATTN_MB=0 disables.
+    # Within those, xpu_attention.hybrid_attention still uses the fused kernel
+    # when it's safe: a tail-padding mask is sliced away (exactly equivalent)
+    # and logits are moderate (max|q|*max|k|*sqrt(D) <= AITK_XPU_FLASH_MAX,
+    # default 2500, where the fused kernel's gradients stay at bf16-level
+    # error); only extreme calls (Krea 2 block 0, ~4e6) pay for the exact one.
+    attn_mb = float(os.environ.get("AITK_XPU_ATTN_MB", "512"))
+    flash_max = float(os.environ.get("AITK_XPU_FLASH_MAX", "2500"))
+    if attn_mb > 0:
+        import torch.nn.functional as F
+        import xpu_attention
+
+        _sdpa = F.scaled_dot_product_attention
+
+        def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+                                         is_causal=False, scale=None, enable_gqa=False, **kw):
+            if (not kw and xpu_attention.supported(query, key, value, attn_mask, dropout_p, is_causal)
+                    and (enable_gqa or query.shape[1] == key.shape[1])
+                    and query.shape[0] * query.shape[1] * query.shape[2] * key.shape[2] * 4
+                    > attn_mb * 1024 ** 2):
+                return xpu_attention.hybrid_attention(query, key, value, attn_mask, scale, enable_gqa,
+                                                      _sdpa, flash_max)
+            return _sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+                         is_causal=is_causal, scale=scale, enable_gqa=enable_gqa, **kw)
+
+        F._xpu_orig_sdpa = _sdpa
+        F.scaled_dot_product_attention = scaled_dot_product_attention
+
+    # ---- layer-offload prefetch -------------------------------------------
+    # ai-toolkit's offload manager is imported long after this shim runs, so
+    # patch it on import: xpu_prefetch copies the next AITK_XPU_PREFETCH
+    # predicted layers (default 3, 0 disables) on a background thread while
+    # the current one computes (see xpu_prefetch.py).
+    pf_depth = int(os.environ.get("AITK_XPU_PREFETCH", "3"))
+    if pf_depth > 0:
+        import importlib.abc
+        import importlib.util
+
+        target_mod = "toolkit.memory_management.manager_modules"
+
+        class _PrefetchHook(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path, target=None):
+                if name != target_mod:
+                    return None
+                sys.meta_path.remove(self)
+                try:
+                    spec = importlib.util.find_spec(name)
+                except Exception:
+                    return None
+                if spec is None or spec.loader is None:
+                    return spec
+                exec_module = spec.loader.exec_module
+
+                def exec_and_patch(module):
+                    exec_module(module)
+                    try:
+                        import xpu_prefetch
+
+                        xpu_prefetch.install(module, pf_depth)
+                    except Exception as e:  # never break the trainer over an optimization
+                        print(f"[xpu_shim] layer prefetch not installed: {e!r}", file=sys.stderr)
+
+                spec.loader.exec_module = exec_and_patch
+                return spec
+
+        sys.meta_path.insert(0, _PrefetchHook())
+
     # ---- non-finite gradient guard ----------------------------------------
     # One inf/NaN gradient is enough to destroy a whole LoRA: global-norm
     # clipping turns the total norm into NaN and multiplies it into *every*

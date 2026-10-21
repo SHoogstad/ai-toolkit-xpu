@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libze-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # loaded via .pth: Ubuntu ships its own sitecustomize.py that would shadow ours
-COPY xpu_shim.py /usr/local/lib/python3.12/dist-packages/xpu_shim.py
+COPY xpu_shim.py xpu_attention.py xpu_prefetch.py /usr/local/lib/python3.12/dist-packages/
 RUN echo "import xpu_shim" > /usr/local/lib/python3.12/dist-packages/zz_xpu_shim.pth
 COPY nvidia-smi /usr/local/bin/nvidia-smi
 COPY start.sh /start.sh

@@ -1,4 +1,6 @@
 *
 !xpu_shim.py
+!xpu_attention.py
+!xpu_prefetch.py
 !nvidia-smi
 !start.sh
