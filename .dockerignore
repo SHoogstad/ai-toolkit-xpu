@@ -4,3 +4,4 @@
 !xpu_prefetch.py
 !nvidia-smi
 !start.sh
+!tests/

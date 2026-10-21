@@ -48,7 +48,8 @@ COPY xpu_shim.py xpu_attention.py xpu_prefetch.py /usr/local/lib/python3.12/dist
 RUN echo "import xpu_shim" > /usr/local/lib/python3.12/dist-packages/zz_xpu_shim.pth
 COPY nvidia-smi /usr/local/bin/nvidia-smi
 COPY start.sh /start.sh
-RUN chmod +x /usr/local/bin/nvidia-smi /start.sh
+COPY tests /opt/xpu-tests
+RUN chmod +x /usr/local/bin/nvidia-smi /start.sh /opt/xpu-tests/run.sh
 
 ENV AITK_XPU=1 \
     AI_TOOLKIT_DB_JOURNAL_MODE=DELETE \

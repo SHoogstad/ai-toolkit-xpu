@@ -10,6 +10,9 @@ Upstream ai-toolkit only supports CUDA. Rather than patching every call site, th
 |---|---|
 | `Dockerfile` | Ubuntu 24.04, Intel compute runtime (kobuk-team PPA), PyTorch 2.13 XPU wheels, ai-toolkit + UI |
 | `xpu_shim.py` | The cuda → xpu remapping, loaded through a `.pth` file when `AITK_XPU=1` |
+| `xpu_attention.py` | Exact, memory-efficient attention for masked calls (see [Attention](#attention-on-xpu)) |
+| `xpu_prefetch.py` | Background prefetch for ai-toolkit's layer offloading (see [Prefetch](#layer-offload-prefetch)) |
+| `tests/` | Pass/fail tests for the XPU-specific parts, shipped in the image at `/opt/xpu-tests` (see [Tests](#tests)) |
 | `nvidia-smi` | A stand-in so the UI can list the GPU and show VRAM, load, temperature and power (from DRM fdinfo and xe hwmon) |
 | `start.sh` | Creates or upgrades the SQLite schema, then starts the UI |
 
@@ -21,7 +24,7 @@ A prebuilt image is on Docker Hub as [`hoogstaddie/ai-toolkit-xpu`](https://hub.
 docker pull hoogstaddie/ai-toolkit-xpu:latest
 ```
 
-Tags: `latest`, release tags such as `v1.1.0` (matching the [GitHub releases](https://github.com/SHoogstad/ai-toolkit-xpu/releases)), and `0473387` for v1.0.0. It's about 12 GB on disk (4.1 GB download).
+Tags: `latest` (the newest stable release), release tags such as `v1.1.1` (matching the [GitHub releases](https://github.com/SHoogstad/ai-toolkit-xpu/releases)), `beta` / `v1.2.0-beta.1` for pre-releases, and `0473387` for v1.0.0. It's about 12 GB on disk (4.1 GB download).
 
 ## Build
 
@@ -81,11 +84,16 @@ Raw bf16 matmul throughput: 27 TFLOPS on the 3060, 104 TFLOPS on the B580.
 
 - **SDXL**: LoRA training and sampling work.
 - **Anima** (`circlestone-labs/Anima-Base-v1.0-Diffusers`): LoRA training and sampling work in bf16 and qfloat8. A 60-image character LoRA at batch 2 ran at about 2.4 s/img.
-- **Krea 2** (`krea/Krea-2-Raw`, about 12B): LoRA training works on the 12 GB B580 with `convrot8` quantization, **80% transformer layer offloading**, batch 1 × gradient accumulation 2, and 512/768 px. A 30-step validation run gave a finite LoRA and a correct sample at about 35 s per step, with 3 of 30 batches skipped by ai-toolkit's OOM handling. At 60% offload it runs out of VRAM. Leave 1024 px out of the training resolutions. It's slow, but it works.
+- **Krea 2** (`krea/Krea-2-Raw`, about 12B): LoRA training works on the 12 GB B580 with `convrot8` quantization, **60% transformer layer offloading**, batch 1 × gradient accumulation 2, and 512/768 px. Leave 1024 px out of the training resolutions. Seconds per step:
 
-  v1.1.0 shipped a Krea 2 attention speed patch (about 11 s per step at 60% offload) that **corrupted LoRAs**. It was removed in v1.1.1; see [Non-finite gradients](#non-finite-gradients).
+  | Version | Offload | Step time | OOM-skipped batches |
+  |---|---|---|---|
+  | v1.1.1 | 80% (60% runs out of VRAM) | about 35 s | about 1 in 10 |
+  | **v1.2.0-beta.1** | **60%** | **about 11–12 s** | **none** |
 
-Use [`bench/validate_model.py`](bench/validate_model.py) before trusting a new model: train about 30 steps, then confirm the saved LoRA is finite and a sample **with** the LoRA isn't black. A finite training loss doesn't prove the weights are fine.
+  v1.1.0 shipped a Krea 2 attention speed patch that **corrupted LoRAs**. It was removed in v1.1.1; see [Non-finite gradients](#non-finite-gradients).
+
+Use [`tests/validate_model.py`](tests/validate_model.py) before trusting a new model: train about 30 steps, then confirm the saved LoRA is finite and a sample **with** the LoRA isn't black. A finite training loss doesn't prove the weights are fine. See [Tests](#tests).
 
 ## Memory on XPU
 
@@ -100,9 +108,39 @@ Both can be overridden with `-e`. Set `AITK_XPU_MEM_FRACTION=1` for the old over
 
 A single inf/NaN gradient is enough to destroy a whole LoRA. Global-norm gradient clipping turns the total norm into NaN and multiplies it into **every** gradient, and the optimizer then writes NaN into all weights. The logged loss stays normal, and every sample afterwards decodes to black.
 
-XPU kernels can hit this where CUDA doesn't. v1.1.0's Krea 2 patch let attention use XPU's fused SDPA kernel. Krea 2's first block has attention logits in the hundreds of thousands, and on those the fused kernel's backward was 31% off and overflowed to inf on the first step. Upstream's masked attention uses the exact MATH path, which handles it, so v1.1.1 removes the patch.
+XPU kernels can hit this where CUDA doesn't. v1.1.0's Krea 2 patch let attention use XPU's fused SDPA kernel. Krea 2's first block has attention logits from about 3,000 to 31,000 (its keys share a large common component). On those, the fused kernel's backward is far off and overflowed to inf on the first step. v1.1.1 removed the patch; v1.2.0 handles these calls with an exact kernel instead (see [Attention](#attention-on-xpu)).
 
 As a safety net for every model, **the shim checks gradients before each optimizer step**. If any are non-finite, it drops that step's update (weights and optimizer state stay untouched) and logs `[xpu_shim] non-finite gradients, skipping this optimizer step`. After 10 in a row (`AITK_XPU_NAN_GUARD_MAX`), it stops training with an error instead of producing a broken LoRA. `AITK_XPU_NAN_GUARD=0` disables it.
+
+## Attention on XPU
+
+On XPU, any attention mask sends `scaled_dot_product_attention` to PyTorch's MATH backend, which keeps the full fp32 score matrix and its gradient in VRAM: about 1.1 GB per tensor for Krea 2. XPU's fused kernel avoids that, but it can't take a mask, and its backward breaks down on extreme logits like Krea 2's first block.
+
+The shim routes masked calls with a score matrix over `AITK_XPU_ATTN_MB` (512) through `xpu_attention.hybrid_attention`:
+
+- **If the mask only hides a padded tail** (the usual text/alignment padding), the padding is sliced off. That's exactly equivalent, and the call runs unmasked.
+- **If logits are moderate** (`max|q| · max|k| · √D ≤ AITK_XPU_FLASH_MAX`, default 2500), it uses the fused kernel. In that range its gradients stay at bf16-level error.
+- **Otherwise**, it uses an exact chunked kernel. It processes queries in chunks and recomputes in the backward, never storing the full matrix (0.43 GB instead of 3.1 GB). Scores, softmax and P·V run in fp32, keys are centred, and the softmax is rebuilt from the saved row max and normalizer rather than a log-sum-exp. On Krea 2's real block-0 tensors its query gradient is 0.07% from a float64 reference, against 0.32% for MATH and over 600% for the fused kernel.
+
+Smaller masked calls stay on MATH, and unmasked calls stay on the fused kernel. `AITK_XPU_ATTN_MB=0` disables the routing.
+
+## Layer-offload prefetch
+
+ai-toolkit's layer offloading copies each offloaded layer's weights to the GPU when that layer is called, on the training thread. With pageable memory that copy blocks, so copy and compute take turns. `xpu_prefetch` learns the order layers are called in from a 16-call history, which is long enough to tell the forward pass from gradient checkpointing's recomputation. It then copies the next `AITK_XPU_PREFETCH` (3) layers on a background thread and stream while the current one computes. After the first step it predicts every layer (Krea 2: 576 per step, 0 misses). Any mismatch, such as changed weights or an unexpected call, falls back to ai-toolkit's original path. `AITK_XPU_PREFETCH=0` disables it.
+
+## Tests
+
+```bash
+docker exec ai-toolkit-xpu /opt/xpu-tests/run.sh
+```
+
+These cover the exact attention kernel against float64 (including the v1.1.0 failure mode), hybrid routing, the NaN guard, and the prefetcher (identical outputs, 0 misses after learning, stale-weight detection). Adding a job config also trains it end-to-end for 30 steps and checks the LoRA and a sample:
+
+```bash
+docker exec ai-toolkit-xpu /opt/xpu-tests/run.sh /app/ai-toolkit/output/<job>/.job_config.json
+```
+
+> **Don't run the tests while a training job uses the GPU.** Two processes together can exceed VRAM, and the driver then resets the GPU, killing the training job too.
 
 ## Shim notes / gotchas
 
