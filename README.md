@@ -24,7 +24,7 @@ A prebuilt image is on Docker Hub as [`hoogstaddie/ai-toolkit-xpu`](https://hub.
 docker pull hoogstaddie/ai-toolkit-xpu:latest
 ```
 
-Tags: `latest` (the newest stable release), release tags such as `v1.1.1` (matching the [GitHub releases](https://github.com/SHoogstad/ai-toolkit-xpu/releases)), `beta` / `v1.2.0-beta.1` for pre-releases, and `0473387` for v1.0.0. It's about 12 GB on disk (4.1 GB download).
+Tags: `latest` (the newest stable release), release tags such as `v1.2.0` (matching the [GitHub releases](https://github.com/SHoogstad/ai-toolkit-xpu/releases)), `beta` for the newest pre-release, and `0473387` for v1.0.0. It's about 12 GB on disk (4.1 GB download).
 
 ## Build
 
@@ -89,7 +89,9 @@ Raw bf16 matmul throughput: 27 TFLOPS on the 3060, 104 TFLOPS on the B580.
   | Version | Offload | Step time | OOM-skipped batches |
   |---|---|---|---|
   | v1.1.1 | 80% (60% runs out of VRAM) | about 35 s | about 1 in 10 |
-  | **v1.2.0-beta.1** | **60%** | **about 11–12 s** | **none** |
+  | **v1.2.0** | **60%** | **about 11–12 s** | **3 in 2000** |
+
+  A full 2000-step character LoRA (60 images plus a regularization set) averaged 11.8 s/step including sample rounds, with 0 non-finite gradients and 98% of layer copies prefetched.
 
   v1.1.0 shipped a Krea 2 attention speed patch that **corrupted LoRAs**. It was removed in v1.1.1; see [Non-finite gradients](#non-finite-gradients).
 
