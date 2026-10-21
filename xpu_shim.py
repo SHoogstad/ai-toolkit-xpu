@@ -263,6 +263,46 @@ def _install():
     if 0 < frac < 1:
         xpu.set_per_process_memory_fraction(frac)
 
+    # ---- non-finite gradient guard ----------------------------------------
+    # One inf/NaN gradient is enough to destroy a whole LoRA: global-norm
+    # clipping turns the total norm into NaN and multiplies it into *every*
+    # gradient, the optimizer writes NaN into all weights, and every sample
+    # after that decodes to black while the logged loss stays finite. XPU
+    # kernels hit this where CUDA doesn't (e.g. fused SDPA backward on Krea 2's
+    # huge block-0 logits), so before every optimizer step: if any gradient is
+    # non-finite, drop all gradients for that step (the optimizer then skips
+    # the update, momentum included) and warn; abort after too many in a row.
+    # AITK_XPU_NAN_GUARD=0 disables it.
+    if os.environ.get("AITK_XPU_NAN_GUARD", "1") == "1":
+        from torch.optim.optimizer import register_optimizer_step_pre_hook
+
+        max_bad = int(os.environ.get("AITK_XPU_NAN_GUARD_MAX", "10"))
+        guard = {"bad": 0, "total": 0}
+
+        def nan_guard(optimizer, args, kwargs):
+            grads = [p.grad for group in optimizer.param_groups for p in group["params"]
+                     if p.grad is not None]
+            if not grads:
+                return None
+            ok = torch.stack([torch.isfinite(g).all() for g in grads]).all().item()
+            if ok:
+                guard["bad"] = 0
+                return None
+            guard["bad"] += 1
+            guard["total"] += 1
+            print(f"[xpu_shim] non-finite gradients, skipping this optimizer step "
+                  f"({guard['bad']} in a row, {guard['total']} total)", file=sys.stderr, flush=True)
+            if guard["bad"] >= max_bad:
+                raise RuntimeError(
+                    f"non-finite gradients for {guard['bad']} optimizer steps in a row; stopping so the "
+                    "weights aren't corrupted (AITK_XPU_NAN_GUARD_MAX raises the limit)")
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    p.grad = None
+            return None
+
+        register_optimizer_step_pre_hook(nan_guard)
+
     # ---- safetensors ----------------------------------------------------
     try:
         import safetensors.torch as st

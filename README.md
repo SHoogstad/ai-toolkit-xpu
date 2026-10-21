@@ -2,7 +2,7 @@
 
 A Docker image that runs [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit) (UI and trainer) on an Intel Arc GPU. It was built and tested on an **Arc B580 (12 GB)**.
 
-Upstream ai-toolkit only supports CUDA. Rather than patching every call site, this image keeps upstream nearly unmodified (two `sed` tweaks and one Krea 2 attention patch) and loads a small **cuda → xpu shim** when Python starts. The shim redirects `"cuda"` devices, `torch.cuda.*` and autocast to `torch.xpu`, and works around Intel driver memory behaviour (see [Memory on XPU](#memory-on-xpu)).
+Upstream ai-toolkit only supports CUDA. Rather than patching every call site, this image keeps upstream unmodified (apart from two `sed` tweaks) and loads a small **cuda → xpu shim** when Python starts. The shim redirects `"cuda"` devices, `torch.cuda.*` and autocast to `torch.xpu`, and works around Intel driver memory behaviour (see [Memory on XPU](#memory-on-xpu)).
 
 ## What's in here
 
@@ -12,7 +12,6 @@ Upstream ai-toolkit only supports CUDA. Rather than patching every call site, th
 | `xpu_shim.py` | The cuda → xpu remapping, loaded through a `.pth` file when `AITK_XPU=1` |
 | `nvidia-smi` | A stand-in so the UI can list the GPU and show VRAM, load, temperature and power (from DRM fdinfo and xe hwmon) |
 | `start.sh` | Creates or upgrades the SQLite schema, then starts the UI |
-| `patches/krea2_xpu_attention.py` | Applied at build time: lets Krea 2 use the fused attention kernel on XPU |
 
 ## Get the image
 
@@ -82,16 +81,11 @@ Raw bf16 matmul throughput: 27 TFLOPS on the 3060, 104 TFLOPS on the B580.
 
 - **SDXL**: LoRA training and sampling work.
 - **Anima** (`circlestone-labs/Anima-Base-v1.0-Diffusers`): LoRA training and sampling work in bf16 and qfloat8. A 60-image character LoRA at batch 2 ran at about 2.4 s/img.
-- **Krea 2** (`krea/Krea-2-Raw`, about 12B): LoRA training works on the 12 GB B580 with `convrot8` quantization, layer offloading and 512/768 px. Seconds per step (batch 1 × gradient accumulation 2):
+- **Krea 2** (`krea/Krea-2-Raw`, about 12B): LoRA training works on the 12 GB B580 with `convrot8` quantization, **80% transformer layer offloading**, batch 1 × gradient accumulation 2, and 512/768 px. A 30-step validation run gave a finite LoRA and a correct sample at about 35 s per step, with 3 of 30 batches skipped by ai-toolkit's OOM handling. At 60% offload it runs out of VRAM. Leave 1024 px out of the training resolutions. It's slow, but it works.
 
-  | Transformer offload | Step time | |
-  |---|---|---|
-  | 80% | about 29 s | stable |
-  | **60%** | **about 11 s** | **stable, recommended** |
-  | 50% | about 11.5 s | occasional OOM-skipped batch |
-  | 40% | n/a | aborts: out of VRAM |
+  v1.1.0 shipped a Krea 2 attention speed patch (about 11 s per step at 60% offload) that **corrupted LoRAs**. It was removed in v1.1.1; see [Non-finite gradients](#non-finite-gradients).
 
-  Leave 1024 px out of the training resolutions: its activations don't fit next to the weights.
+Use [`bench/validate_model.py`](bench/validate_model.py) before trusting a new model: train about 30 steps, then confirm the saved LoRA is finite and a sample **with** the LoRA isn't black. A finite training loss doesn't prove the weights are fine.
 
 ## Memory on XPU
 
@@ -102,7 +96,13 @@ Intel's xe driver behaves differently from CUDA in two ways that matter for big 
 
 Both can be overridden with `-e`. Set `AITK_XPU_MEM_FRACTION=1` for the old overcommitting behaviour.
 
-Krea 2 additionally always passed an attention mask, which forces XPU's slow MATH attention: 6× slower, with the full attention matrix in VRAM. `patches/krea2_xpu_attention.py` skips the mask when nothing is actually masked, which is numerically identical.
+## Non-finite gradients
+
+A single inf/NaN gradient is enough to destroy a whole LoRA. Global-norm gradient clipping turns the total norm into NaN and multiplies it into **every** gradient, and the optimizer then writes NaN into all weights. The logged loss stays normal, and every sample afterwards decodes to black.
+
+XPU kernels can hit this where CUDA doesn't. v1.1.0's Krea 2 patch let attention use XPU's fused SDPA kernel. Krea 2's first block has attention logits in the hundreds of thousands, and on those the fused kernel's backward was 31% off and overflowed to inf on the first step. Upstream's masked attention uses the exact MATH path, which handles it, so v1.1.1 removes the patch.
+
+As a safety net for every model, **the shim checks gradients before each optimizer step**. If any are non-finite, it drops that step's update (weights and optimizer state stay untouched) and logs `[xpu_shim] non-finite gradients, skipping this optimizer step`. After 10 in a row (`AITK_XPU_NAN_GUARD_MAX`), it stops training with an error instead of producing a broken LoRA. `AITK_XPU_NAN_GUARD=0` disables it.
 
 ## Shim notes / gotchas
 

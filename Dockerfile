@@ -43,10 +43,6 @@ RUN cd ui && npm ci && npm run update_db && npm run build
 RUN apt-get update && apt-get install -y --no-install-recommends libze-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Krea 2: unmasked SDPA on XPU when nothing is masked (see the script)
-COPY patches/krea2_xpu_attention.py /tmp/krea2_xpu_attention.py
-RUN python3 /tmp/krea2_xpu_attention.py /app/ai-toolkit
-
 # loaded via .pth: Ubuntu ships its own sitecustomize.py that would shadow ours
 COPY xpu_shim.py /usr/local/lib/python3.12/dist-packages/xpu_shim.py
 RUN echo "import xpu_shim" > /usr/local/lib/python3.12/dist-packages/zz_xpu_shim.pth
